@@ -1,4 +1,6 @@
 #include <iostream>
+#include <iomanip>
+#include <float.h>
 #include <string>
 #include <boost/system.hpp>
 #include <boost/asio.hpp>
@@ -25,8 +27,19 @@ using asio::deadline_timer;
 class pinger {
 public:
   pinger(asio::io_service& io_service, const char* destination)
-      : resolver_(io_service), socket_(io_service, icmp::v4()),
-      timer_(io_service), sequence_number_(0), num_replies_(0) {
+      : resolver_(io_service),
+      socket_(io_service, icmp::v4()),
+      timer_(io_service),
+      sequence_number_(0),
+      num_replies_(0),
+      signals_(io_service, SIGINT),
+      time_init_(posix_time::microsec_clock::universal_time()),
+      num_transmitted_(0), num_received_(0),
+      ttl_min_(LDBL_MAX), ttl_max_(0),
+      ttl_sum_(0), ttl_sum2_(0)
+  {
+    signals_.async_wait(boost::bind(&pinger::handle_termination,
+          this, asio::placeholders::error, asio::placeholders::signal_number));
     // basic_resolver: protocol, services, flags
     icmp::resolver::query query(icmp::v4(), destination, "");
     // a iterator of queried endpoint is returned
@@ -36,6 +49,28 @@ public:
     start_receive();
   }
 private:
+  void handle_termination(const error_code& ec, int n) {
+    auto now = posix_time::microsec_clock::universal_time();
+    long double total_time = (now - time_init_).total_milliseconds() / 1000.0;
+    ttl_sum_ /= num_received_;
+    ttl_sum2_ /= num_received_;
+    long double ttl_mdev = sqrtl(ttl_sum2_ - ttl_sum_ * ttl_sum_);
+    std::cout << std::endl
+      << num_transmitted_ << " packets transmitted, "
+      << num_received_ << " received, "
+      << num_transmitted_ - num_received_ << " lossed, "
+      << std::fixed << std::setprecision(2)
+      << (num_transmitted_ - num_received_) / static_cast<long double>(num_transmitted_)
+      << "\% loss, time "
+      << std::setprecision(3) << total_time << " s\n"
+      << "rtt min/avg/max/mdev "
+      << ttl_min_ << "/"
+      << ttl_sum_ << "/"
+      << ttl_max_ << "/"
+      << ttl_mdev << " ms\n";
+    exit(0);
+  }
+
   // Consider the time to send the message
   // 1. First send, every thing is ok
   // 2. Send after 5s's timeout call, and if the valid return message is
@@ -63,6 +98,7 @@ private:
     echo_request.identifier(get_identifier());
     echo_request.sequence_number(++sequence_number_);
     compute_checksum(echo_request, body.begin(), body.end());
+    ++num_transmitted_;
 
     // Encode
     asio::streambuf request_buffer;
@@ -122,12 +158,20 @@ private:
         // Call handle_timeout only when the first valid message arrive
         if (num_replies_++ == 0)
           timer_.cancel();
+
         posix_time::ptime now = posix_time::microsec_clock::universal_time();
+        ++num_received_;
+        long double ttl = (now - time_sent_).total_microseconds() / 1000.0;
+        ttl_min_ = fmin(ttl_min_, ttl);
+        ttl_max_ = fmax(ttl_max_, ttl);
+        ttl_sum_ += ttl;
+        ttl_sum2_ += ttl * ttl;
         std::cout << length - ipv4_hdr.header_length()
           << " bytes from " << ipv4_hdr.source_address()
           << ": icmp_seq=" << icmp_hdr.sequence_number()
           << ", ttl=" << ipv4_hdr.time_to_live()
-          << ", time=" << (now - time_sent_).total_microseconds() / 1000.0 << " ms"
+          << ", time=" << std::fixed << std::setprecision(3)
+          << ttl << " ms"
           << std::endl;
       }
     }
@@ -146,6 +190,15 @@ private:
   posix_time::ptime time_sent_;
   asio::streambuf reply_buffer_;
   std::size_t num_replies_;
+
+  asio::signal_set signals_;
+  posix_time::ptime time_init_;
+  std::size_t num_transmitted_;
+  std::size_t num_received_;
+  long double ttl_min_;
+  long double ttl_max_;
+  long double ttl_sum_;
+  long double ttl_sum2_;
 };
 
 }
